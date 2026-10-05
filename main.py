@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import platform
+import queue
 import subprocess
 import zipfile
 
@@ -73,7 +74,13 @@ from services.telemetry_manager import (
     set_client_device_token,
     submit_feedback,
 )
-from utils.utils import get_docs_data_dir, get_legacy_docs_data_dir, get_log_dir, open_folder_cross_platform
+from utils.utils import (
+    get_docs_data_dir,
+    get_legacy_docs_data_dir,
+    get_log_dir,
+    open_folder_cross_platform,
+    open_path_cross_platform,
+)
 from services.remote_asset_cache import RemoteAssetCache
 try:
     from services.theme_unlock import ThemeUnlockService
@@ -675,6 +682,14 @@ def _run_startup_self_test() -> int:
             log.error("[SELF-TEST] Windows 未安装 WebView2 Runtime")
             return 6
 
+    if sys.platform == "darwin":
+        # macOS 使用 pywebview 自带的 Cocoa/WKWebView 后端，依赖 pyobjc
+        try:
+            from webview.platforms import cocoa  # noqa: F401
+        except Exception:
+            log.exception("[SELF-TEST] Cocoa 后端不可用（缺少 pyobjc）")
+            return 4
+
     log.info("[SELF-TEST] 通过：pywebview、前端资源和平台运行时检查正常")
     return 0
 
@@ -709,6 +724,49 @@ def _launch_detached(args, *, cwd: str | None = None) -> None:
         popen_kwargs["close_fds"] = False
 
     subprocess.Popen(args, **popen_kwargs)
+
+
+def _schedule_process_exit(delay: float = 0.0) -> None:
+    """在 delay 秒后强制结束进程，作为退出流程的兜底（避免界面调用卡住导致进程残留）。"""
+    if delay <= 0:
+        os._exit(0)
+    timer = threading.Timer(delay, lambda: os._exit(0))
+    timer.daemon = True
+    timer.start()
+
+
+def _macos_app_bundles_for_game_root(game_root: Path) -> tuple[Path | None, Path | None]:
+    """
+    从 macOS 游戏根目录反推所属的 .app bundle。
+
+    Returns:
+        (游戏本体 bundle, 官方启动器 bundle)，找不到时为 None。
+    """
+    game_bundle: Path | None = None
+    launcher_bundle: Path | None = None
+    try:
+        for candidate in (game_root, *game_root.parents):
+            if candidate.suffix != ".app":
+                continue
+            if candidate.name == "WarThunderLauncher.app":
+                launcher_bundle = launcher_bundle or candidate
+            elif game_bundle is None:
+                game_bundle = candidate
+    except Exception:
+        pass
+    return game_bundle, launcher_bundle
+
+
+def _macos_aces_binary(game_root: Path) -> Path | None:
+    """返回 macOS 游戏客户端的可执行文件（WarThunder.app/Contents/MacOS/aces）。"""
+    try:
+        for candidate in (game_root, *game_root.parents):
+            if candidate.suffix == ".app":
+                binary = candidate / "Contents" / "MacOS" / "aces"
+                return binary if binary.is_file() else None
+    except Exception:
+        pass
+    return None
 
 
 def _parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -753,6 +811,13 @@ class AppApi:
         self._perf_enabled = bool(perf_enabled)
         self._background_start_paused = False
 
+        # 日志 -> 前端：只入队，由专用线程推送。
+        # pywebview 的 evaluate_js 会阻塞等待 GUI 主线程，若在 logging handler
+        # 持锁期间调用，任何主线程日志都会与推送线程形成死锁（macOS 菜单栏回调即如此）。
+        self._ui_log_queue: "queue.Queue" = queue.Queue(maxsize=500)
+        self._ui_log_pusher_lock = threading.Lock()
+        self._ui_log_pusher_started = False
+
         # 保存 PyWebview Window 引用（用于调用 evaluate_js 与打开系统对话框）
 
         # 连接 logger -> 前端 UI（窗口未创建时会自动忽略）
@@ -770,12 +835,16 @@ class AppApi:
         self._cfg_mgr = ConfigManager()
         self._resource_paths = ResourcePathManager(self._cfg_mgr.config, app_version=APP_VERSION)
         runtime_executable = Path(sys.executable) if getattr(sys, "frozen", False) else Path(__file__).resolve()
+        # macOS 的 .app bundle 内部不适合放安装身份文件，统一放到应用数据目录
+        install_dir = (
+            get_docs_data_dir() if sys.platform == "darwin" else runtime_executable.parent
+        )
         self._startup_registration = register_startup_installation(
             self._cfg_mgr,
             self._resource_paths,
             app_version=APP_VERSION,
             migration=_startup_migration_result,
-            install_dir=runtime_executable.parent,
+            install_dir=install_dir,
             executable_path=runtime_executable,
             resource_migration_choice_provider=_show_resource_migration_choice,
         )
@@ -798,7 +867,12 @@ class AppApi:
         self._task_mgr = TaskManager(task_library_dir=str(resource_paths.task_library_dir))
         self._model_mgr = ModelManager(model_library_dir=str(resource_paths.model_library_dir))
         self._hangar_mgr = HangarManager(hangar_library_dir=str(resource_paths.hangar_library_dir))
-        self._bank_preview_mgr = BankPreviewService(BASE_DIR)
+        preview_cache_dir = (
+            get_docs_data_dir() / "cache" / "preview_audio"
+            if sys.platform == "darwin"
+            else None
+        )
+        self._bank_preview_mgr = BankPreviewService(BASE_DIR, cache_dir=preview_cache_dir)
         self._logic = CoreService()
         self._sound_replace = SoundReplaceService(resource_paths.sound_backup_dir)
         self._audition_items_cache = {}
@@ -1991,7 +2065,59 @@ class AppApi:
 
     def _append_log_to_ui(self, formatted_message: str, record):
         """
-        将 logger 的输出追加到前端日志面板。
+        日志回调入口：只把记录放入队列，绝不阻塞调用线程。
+
+        pywebview 的 evaluate_js 需要等待 GUI 主线程执行脚本，而本方法是在
+        logging handler 持锁期间被调用的；若在此直接调用 evaluate_js，
+        推送线程与主线程会互相等待形成死锁（macOS 菜单栏菜单回调会触发）。
+        """
+        if not self._window:
+            return
+
+        self._ensure_ui_log_pusher()
+        try:
+            self._ui_log_queue.put_nowait((formatted_message, record))
+        except queue.Full:
+            # 丢弃最旧的一条，保证日志推送不会拖慢主流程
+            try:
+                self._ui_log_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._ui_log_queue.put_nowait((formatted_message, record))
+            except queue.Full:
+                pass
+
+    def _ensure_ui_log_pusher(self) -> None:
+        if self._ui_log_pusher_started:
+            return
+        with self._ui_log_pusher_lock:
+            if self._ui_log_pusher_started:
+                return
+            self._ui_log_pusher_started = True
+            threading.Thread(
+                target=self._ui_log_pusher_loop,
+                name="UiLogPusher",
+                daemon=True,
+            ).start()
+
+    def _ui_log_pusher_loop(self) -> None:
+        while True:
+            try:
+                item = self._ui_log_queue.get()
+            except Exception:
+                return
+            if item is None:
+                return
+            formatted_message, record = item
+            try:
+                self._push_log_record_to_ui(formatted_message, record)
+            except Exception:
+                pass
+
+    def _push_log_record_to_ui(self, formatted_message: str, record):
+        """
+        将 logger 的输出追加到前端日志面板（由 UiLogPusher 线程调用）。
         record: logging.LogRecord (从 logger.py 传入)
         """
         if not self._window:
@@ -2254,6 +2380,11 @@ class AppApi:
             os._exit(0)
 
         self._window.destroy()
+        if sys.platform == "darwin":
+            # pywebview 的 Cocoa 后端在关闭最后一个窗口后不会自动结束进程
+            # （没有实现 applicationShouldTerminateAfterLastWindowClosed），
+            # 这里延后强制退出，避免残留进程被系统判定为无响应。
+            _schedule_process_exit(0.5)
 
     # --- 核心业务 API (供 JS 调用) ---
     def _log_init_path_state(self, path, is_valid):
@@ -2278,6 +2409,13 @@ class AppApi:
         is_valid = False
         if path:
             is_valid, _ = self._logic.validate_game_path(path)
+            resolved_root = self._logic.game_root
+            if is_valid and resolved_root is not None and str(resolved_root) != path:
+                # macOS 会把外层目录/app bundle 规范化为真实游戏根，登记规范化结果
+                normalized = str(resolved_root)
+                if self._cfg_mgr.set_game_path(normalized):
+                    log.info(f"[INIT] 已登记规范化游戏路径: {normalized}")
+                    path = normalized
             self._log_init_path_state(path, is_valid)
 
         if sights_path:
@@ -2425,6 +2563,9 @@ class AppApi:
                 except Exception as e:
                     self._logger.warning(f"[WARN] Steam 启动失败: {e}，尝试使用启动器...")
 
+            if sys.platform == "darwin":
+                return self._start_game_macos(game_root, mode)
+
             launcher_exe = game_root / "launcher.exe"
             aces_exe_64 = game_root / "win64" / "aces.exe"
             aces_exe_32 = game_root / "win32" / "aces.exe"
@@ -2467,6 +2608,50 @@ class AppApi:
                 "message_key": "home.start_game_exception",
                 "message_params": {"message": str(e)},
             }
+
+    def _start_game_macos(self, game_root: Path, mode: str) -> dict:
+        """
+        macOS 启动分支：游戏本体与官方启动器都在 app bundle 内，
+        只有 Steam 协议、启动器 bundle、aces 可执行文件三种可用的启动方式。
+        """
+        game_bundle, launcher_bundle = _macos_app_bundles_for_game_root(game_root)
+
+        if mode == "aces":
+            aces_binary = _macos_aces_binary(game_root)
+            if aces_binary is not None:
+                try:
+                    self._logger.info(f"[INFO] 正在启动游戏: {aces_binary} ...")
+                    _launch_detached([str(aces_binary)], cwd=str(aces_binary.parent))
+                    return {"success": True}
+                except Exception as e:
+                    self._logger.error(f"[ERROR] 启动失败: {e}", exc_info=True)
+                    return {
+                        "success": False,
+                        "message_key": "home.start_game_failed_with_message",
+                        "message_params": {"message": str(e)},
+                    }
+        else:
+            target_bundle = launcher_bundle or game_bundle
+            if target_bundle is not None:
+                try:
+                    self._logger.info(f"[INFO] 正在启动应用: {target_bundle} ...")
+                    _launch_detached(["open", str(target_bundle)])
+                    return {"success": True}
+                except Exception as e:
+                    self._logger.error(f"[ERROR] 启动失败: {e}", exc_info=True)
+                    return {
+                        "success": False,
+                        "message_key": "home.start_game_failed_with_message",
+                        "message_params": {"message": str(e)},
+                    }
+
+        # 兜底：走 Steam 协议启动（部分用户的 macOS 版由 Steam 安装与更新）
+        if _open_url("steam://rungameid/236390"):
+            self._logger.info("[INFO] 已通过 Steam 协议启动 War Thunder")
+            return {"success": True}
+
+        self._logger.error("[ERROR] 未找到可启动的 War Thunder 应用 (app bundle / aces)")
+        return {"success": False, "message_key": "home.start_game_executable_not_found"}
 
     def get_telemetry_status(self):
         """
@@ -2822,10 +3007,12 @@ class AppApi:
             path = folder[0].replace(os.sep, "/")
             valid, msg = self._logic.validate_game_path(path)
             if valid:
-                if not self._cfg_mgr.set_game_path(path):
+                # macOS 上允许用户选择外层安装目录/app bundle，这里存规范化后的游戏根
+                resolved_path = str(self._logic.game_root or path)
+                if not self._cfg_mgr.set_game_path(resolved_path):
                     return {"valid": False, "path": path, "msg": "路径登记保存失败，仍使用原路径"}
-                log.info(f"[SUCCESS] 手动加载路径: {path}")
-                return {"valid": True, "path": path}
+                log.info(f"[SUCCESS] 手动加载路径: {resolved_path}")
+                return {"valid": True, "path": resolved_path}
             else:
                 log.error(f"路径无效: {msg}")
                 return {"valid": False, "path": path, "msg": msg}
@@ -3965,15 +4152,8 @@ class AppApi:
         elif folder_type == "game":
             path = self._cfg_mgr.get_game_path()
             if path and os.path.exists(path):
-                try:
-                    if platform.system() == "Windows":
-                        os.startfile(path)
-                    elif platform.system() == "Darwin":
-                        subprocess.Popen(["open", path])
-                    else:
-                        subprocess.Popen(["xdg-open", path])
-                except Exception as e:
-                    log.error(f"打开游戏目录失败: {e}")
+                if not open_path_cross_platform(path):
+                    log.error(f"打开游戏目录失败: {path}")
             else:
                 log.warning("游戏路径无效或未设置")
         elif folder_type == "userskins":
@@ -3982,10 +4162,11 @@ class AppApi:
             if not valid:
                 log.warning("未设置有效游戏路径，无法打开 UserSkins")
                 return
-            userskins_dir = self._skins_mgr.get_userskins_dir(path)
+            userskins_dir = self._skins_mgr.get_userskins_dir(self._logic.game_root or path)
             try:
                 userskins_dir.mkdir(parents=True, exist_ok=True)
-                os.startfile(str(userskins_dir))
+                if not open_path_cross_platform(userskins_dir):
+                    log.error(f"打开 UserSkins 失败: {userskins_dir}")
             except Exception as e:
                 log.error(f"打开 UserSkins 失败: {e}")
         elif folder_type == "user_missions":
@@ -3994,10 +4175,12 @@ class AppApi:
             if not valid:
                 log.warning("未设置有效游戏路径，无法打开 UserMissions")
                 return
-            user_missions_dir = Path(path) / "UserMissions"
+            game_root = self._logic.game_root or Path(path)
+            user_missions_dir = Path(game_root) / "UserMissions"
             try:
                 user_missions_dir.mkdir(parents=True, exist_ok=True)
-                os.startfile(str(user_missions_dir))
+                if not open_path_cross_platform(user_missions_dir):
+                    log.error(f"打开 UserMissions 失败: {user_missions_dir}")
             except Exception as e:
                 log.error(f"打开 UserMissions 失败: {e}")
         elif folder_type == "task_library":
@@ -4031,12 +4214,8 @@ class AppApi:
             if not target.exists() or not target.is_dir():
                 return {"success": False, "msg": "语音包目录不存在"}
 
-            if platform.system() == "Windows":
-                os.startfile(str(target))
-            elif platform.system() == "Darwin":
-                subprocess.Popen(["open", str(target)])
-            else:
-                subprocess.Popen(["xdg-open", str(target)])
+            if not open_path_cross_platform(target):
+                return {"success": False, "msg": "打开失败：系统文件管理器不可用"}
             return {"success": True}
         except Exception as e:
             log.error(f"打开语音包目录失败: {e}")
@@ -4051,11 +4230,11 @@ class AppApi:
         - 参数:
           - url: str，要打开的链接。
         - 返回: None
-        - 外部资源/依赖: os.startfile 或 webbrowser
+        - 外部资源/依赖: 系统默认协议处理器（Windows: os.startfile / macOS: open / Linux: xdg-open）
 
         实现逻辑:
         - 校验协议，若无则补充 https://。
-        - 使用 os.startfile (Windows) 打开连接。
+        - 使用系统默认方式打开连接。
         """
         if not url:
             return
@@ -4081,11 +4260,8 @@ class AppApi:
             self._logger.error(f"[ERROR] 外部链接校验失败: {e}")
             return
 
-        try:
-            import os
-            os.startfile(u)
-        except Exception as e:
-            self._logger.error(f"[ERROR] 无法打开链接: {e}")
+        if not _open_url(u):
+            self._logger.error(f"[ERROR] 无法打开链接: {u}")
 
     # --- 辅助方法 ---
     def update_loading_ui(self, progress, message):
@@ -6161,7 +6337,8 @@ class AppApi:
         valid, msg = self._logic.validate_game_path(path)
         if not valid:
             return None, msg or "未设置有效游戏路径"
-        return path, ""
+        # 返回规范化后的游戏根（macOS 下配置里可能仍是外层目录）
+        return str(self._logic.game_root or path), ""
 
     def check_sound_replace_disclaimer(self):
         return {
@@ -8273,7 +8450,12 @@ def _setup_tray(window):
     def on_exit():
         """托盘菜单：退出程序"""
         log.info("[TRAY] 用户通过托盘退出程序")
-        tray_manager.stop()
+        # 兜底：即使下面的界面调用卡住，也要保证进程退出
+        _schedule_process_exit(2.0)
+        try:
+            tray_manager.stop()
+        except Exception as e:
+            log.error(f"[TRAY] 停止系统托盘失败: {e}")
         try:
             window.destroy()
         except Exception:

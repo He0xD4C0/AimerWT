@@ -15,6 +15,7 @@ from __future__ import annotations
 """
 import os
 import sys
+import tempfile
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -23,15 +24,107 @@ try:
     import pystray
     from PIL import Image, ImageDraw
     PYSTRAY_AVAILABLE = True
-except ImportError:
+except Exception:
+    # 除缺少依赖外，pystray 在无显示环境（headless Linux 无 DISPLAY）导入时
+    # 会抛 Xlib.error.DisplayNameError，这里同样降级为“托盘不可用”。
     PYSTRAY_AVAILABLE = False
     pystray = None
     Image = None
     ImageDraw = None
 
+IS_DARWIN = sys.platform == "darwin"
+
+# macOS 使用 pyobjc 原生状态栏（pystray 的 darwin 后端要求在主线程创建图标，
+# 与 pywebview 的 Cocoa 事件循环冲突，实测会抛
+# "NSWindow should only be instantiated on the main thread!"）。
+if IS_DARWIN:
+    try:
+        import objc
+        from AppKit import (
+            NSImage,
+            NSMenu,
+            NSMenuItem,
+            NSStatusBar,
+            NSVariableStatusItemLength,
+        )
+        from Foundation import NSObject
+        from PyObjCTools import AppHelper
+
+        MACOS_TRAY_AVAILABLE = True
+    except Exception:  # pragma: no cover - 取决于运行环境是否有 pyobjc
+        MACOS_TRAY_AVAILABLE = False
+        objc = None
+        NSImage = NSMenu = NSMenuItem = NSStatusBar = None
+        NSVariableStatusItemLength = None
+        NSObject = object
+        AppHelper = None
+else:
+    MACOS_TRAY_AVAILABLE = False
+    objc = None
+    NSImage = NSMenu = NSMenuItem = NSStatusBar = None
+    NSVariableStatusItemLength = None
+    NSObject = object
+    AppHelper = None
+
 from utils.logger import get_logger
 
 log = get_logger(__name__)
+
+if MACOS_TRAY_AVAILABLE:
+
+    class _MacStatusBarHandler(NSObject):
+        """状态栏菜单回调：统一在 Cocoa 主线程上被调用。"""
+
+        def init(self):
+            self = objc.super(_MacStatusBarHandler, self).init()
+            if self is None:
+                return None
+            self._callbacks = {}
+            self._item_callbacks = {}
+            return self
+
+        @objc.python_method
+        def bind(self, callbacks, item_callbacks):
+            self._callbacks = dict(callbacks or {})
+            self._item_callbacks = dict(item_callbacks or {})
+
+        @objc.python_method
+        def _dispatch(self, callback):
+            if not callback:
+                return
+
+            def _run():
+                try:
+                    callback()
+                except Exception as e:
+                    log.error(f"托盘菜单回调失败: {e}")
+
+            # NSStatusItem 的菜单动作在 Cocoa 主线程执行；而 pywebview 的
+            # evaluate_js / destroy 等接口会等待主线程处理，在主线程里调用会自死锁
+            # （表现为菜单点“退出”后进程卡住、系统提示.app无响应）。
+            # 因此统一转交后台线程执行，与 Windows/Linux 的 pystray 行为保持一致。
+            if threading.current_thread() is threading.main_thread():
+                threading.Thread(
+                    target=_run, name="MacTrayMenuAction", daemon=True
+                ).start()
+                return
+            _run()
+
+        def showWindow_(self, sender):
+            self._dispatch(self._callbacks.get("show"))
+
+        def hideWindow_(self, sender):
+            self._dispatch(self._callbacks.get("hide"))
+
+        def quitApp_(self, sender):
+            self._dispatch(self._callbacks.get("quit"))
+
+        def menuItemClicked_(self, sender):
+            try:
+                index = int(sender.tag())
+            except Exception:
+                return
+            self._dispatch(self._item_callbacks.get(index))
 
 
 class TrayManager:
@@ -54,9 +147,15 @@ class TrayManager:
         self._on_exit: Optional[Callable] = None
         self._menu_items: list = []
         self._lock = threading.Lock()
+        # macOS 原生状态栏对象
+        self._status_item = None
+        self._status_handler = None
+        self._status_image_path: Optional[str] = None
 
     def is_available(self) -> bool:
         """检查托盘功能是否可用。"""
+        if IS_DARWIN:
+            return bool(MACOS_TRAY_AVAILABLE and Image is not None)
         return PYSTRAY_AVAILABLE
 
     def setup(self, window, on_show: Callable, on_exit: Callable, 
@@ -203,6 +302,9 @@ class TrayManager:
         if not self.is_available():
             return False
 
+        if IS_DARWIN:
+            return self._start_macos()
+
         with self._lock:
             if self._icon is not None:
                 return True  # 已经启动
@@ -225,8 +327,183 @@ class TrayManager:
                 self._icon = None
                 return False
 
+    # --- macOS 原生菜单栏实现 ---
+
+    def _start_macos(self) -> bool:
+        """在 Cocoa 主线程上创建 NSFStatusItem（pystray 在 macOS 上不可用）。"""
+        with self._lock:
+            if self._status_item is not None:
+                return True
+            callbacks = {
+                "show": self._macos_show_window,
+                "hide": self._macos_hide_window,
+                "quit": self._macos_exit_app,
+            }
+            menu_items = [
+                dict(item) for item in (self._menu_items or []) if isinstance(item, dict)
+            ]
+
+        menu_item_callbacks = {
+            index: item["callback"]
+            for index, item in enumerate(menu_items)
+            if callable(item.get("callback"))
+        }
+
+        result: dict = {}
+        done = threading.Event()
+        try:
+            AppHelper.callAfter(
+                self._create_macos_status_item,
+                callbacks,
+                menu_items,
+                menu_item_callbacks,
+                result,
+                done,
+            )
+        except Exception as e:
+            log.error(f"启动系统托盘失败: {e}")
+            return False
+
+        # 菜单栏对象必须在主线程创建；启动早期主事件循环可能还没跑起来，
+        # 此时排队调用依然会执行，只是拿不到同步结果。
+        if not done.wait(3.0):
+            log.warning("[TRAY] macOS 菜单栏图标改为异步创建（主事件循环尚未就绪）")
+            return True
+
+        if result.get("ok"):
+            log.info("系统托盘已启动 (macOS 菜单栏)")
+            return True
+        return False
+
+    def _create_macos_status_item(
+        self,
+        callbacks: dict,
+        menu_items: list,
+        menu_item_callbacks: dict,
+        result: dict,
+        done: threading.Event,
+    ) -> None:
+        """必须是 Cocoa 主线程：创建状态栏图标与菜单。"""
+        status_item = None
+        try:
+            status_item = NSStatusBar.systemStatusBar().statusItemWithLength_(
+                NSVariableStatusItemLength
+            )
+            icon_path = self._write_macos_icon_file()
+            if icon_path:
+                image = NSImage.alloc().initWithContentsOfFile_(icon_path)
+                if image is not None:
+                    image.setSize_((22.0, 22.0))
+                    try:
+                        image.setTemplate_(False)
+                    except Exception:
+                        pass
+                    status_item.button().setImage_(image)
+            try:
+                status_item.button().setToolTip_("AimerWT - 战雷工具箱")
+            except Exception:
+                pass
+
+            handler = _MacStatusBarHandler.alloc().init()
+            handler.bind(callbacks, menu_item_callbacks)
+
+            menu = NSMenu.alloc().init()
+            try:
+                menu.setAutoenablesItems_(False)
+            except Exception:
+                pass
+
+            for title, action in (("显示窗口", "showWindow:"), ("隐藏窗口", "hideWindow:")):
+                entry = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    title, action, ""
+                )
+                entry.setTarget_(handler)
+                menu.addItem_(entry)
+
+            custom_items = [item for item in menu_items if not item.get("separator")]
+            if custom_items:
+                menu.addItem_(NSMenuItem.separatorItem())
+                for index, item in enumerate(menu_items):
+                    if item.get("separator"):
+                        menu.addItem_(NSMenuItem.separatorItem())
+                        continue
+                    entry = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                        str(item.get("text") or ""), "menuItemClicked:", ""
+                    )
+                    entry.setTag_(index)
+                    entry.setTarget_(handler)
+                    if item.get("checked"):
+                        entry.setState_(1)
+                    menu.addItem_(entry)
+
+            menu.addItem_(NSMenuItem.separatorItem())
+            quit_entry = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "退出", "quitApp:", ""
+            )
+            quit_entry.setTarget_(handler)
+            menu.addItem_(quit_entry)
+
+            status_item.setMenu_(menu)
+
+            with self._lock:
+                self._status_item = status_item
+                self._status_handler = handler
+            result["ok"] = True
+        except Exception as e:
+            log.error(f"启动系统托盘失败: {e}")
+            if status_item is not None:
+                try:
+                    NSStatusBar.systemStatusBar().removeStatusItem_(status_item)
+                except Exception:
+                    pass
+            result["ok"] = False
+        finally:
+            done.set()
+
+    def _write_macos_icon_file(self) -> Optional[str]:
+        """把现有 logo 转成 22pt（44px，含 Retina）PNG 供状态栏使用。"""
+        try:
+            image = self.create_icon_image(44, 44)
+            if image is None:
+                return None
+            path = Path(tempfile.gettempdir()) / "aimerwt_status_icon.png"
+            image.save(path, format="PNG")
+            self._status_image_path = str(path)
+            return self._status_image_path
+        except Exception as e:
+            log.warning(f"生成 macOS 菜单栏图标失败: {e}")
+            return None
+
+    def _macos_show_window(self) -> None:
+        if self._on_show:
+            try:
+                self._on_show()
+            except Exception as e:
+                log.error(f"托盘显示窗口回调失败: {e}")
+
+    def _macos_hide_window(self) -> None:
+        window = self._window
+        if window is None:
+            return
+        try:
+            window.hide()
+        except Exception as e:
+            log.error(f"托盘隐藏窗口失败: {e}")
+
+    def _macos_exit_app(self) -> None:
+        self.stop()
+        if self._on_exit:
+            try:
+                self._on_exit()
+            except Exception as e:
+                log.error(f"托盘退出回调失败: {e}")
+
     def stop(self):
         """停止托盘图标。"""
+        if IS_DARWIN:
+            self._stop_macos()
+            return
+
         with self._lock:
             if self._icon is not None:
                 try:
@@ -237,6 +514,27 @@ class TrayManager:
                 finally:
                     self._icon = None
 
+    def _stop_macos(self) -> None:
+        with self._lock:
+            status_item = self._status_item
+            self._status_item = None
+            self._status_handler = None
+
+        if status_item is None:
+            return
+
+        def _remove():
+            try:
+                NSStatusBar.systemStatusBar().removeStatusItem_(status_item)
+                log.info("系统托盘已停止")
+            except Exception as e:
+                log.error(f"停止系统托盘失败: {e}")
+
+        try:
+            AppHelper.callAfter(_remove)
+        except Exception:
+            _remove()
+
     def notify(self, title: str, message: str, duration: int = 3):
         """
         显示托盘通知。
@@ -246,6 +544,11 @@ class TrayManager:
             message: 通知内容
             duration: 显示时长（秒）
         """
+        if IS_DARWIN:
+            # macOS 通知中心需要 bundle 与用户授权，这里只记录日志
+            log.info(f"[TRAY] 通知: {title} - {message}")
+            return
+
         if not self.is_available() or self._icon is None:
             return
 
@@ -256,6 +559,9 @@ class TrayManager:
 
     def is_running(self) -> bool:
         """检查托盘是否正在运行。"""
+        if IS_DARWIN:
+            with self._lock:
+                return self._status_item is not None
         with self._lock:
             return self._icon is not None
 

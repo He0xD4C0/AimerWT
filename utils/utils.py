@@ -61,8 +61,14 @@ def get_legacy_docs_data_dir() -> Path:
 
 def get_app_data_dir() -> Path:
     """
-    獲取程式目前的路徑
+    获取程序数据目录（资源库、待解压区、实例标识、缓存等写入位置）。
+
+    - Windows/Linux：打包后跟随可执行文件（绿色版），源码运行跟随仓库目录
+    - macOS：始终使用 ~/Library/Application Support/AimerWT
+      （.app bundle 属于只读语义的包体，应用数据不应写进 bundle 内部）
     """
+    if platform.system() == "Darwin":
+        return get_docs_data_dir()
     if getattr(sys, 'frozen', False):
         return Path(sys.executable).parent
     else:
@@ -228,6 +234,37 @@ def safe_filename(filename: str, replacement: str = "_") -> str:
     return filename
 
 
+def open_path_cross_platform(target: Path | str) -> bool:
+    """
+    跨平台用系统默认方式打开文件/文件夹/链接（Windows 用 os.startfile，
+    macOS 用 open，Linux 用 xdg-open）。
+
+    Args:
+        target: 文件夹、文件路径或系统可识别的链接
+
+    Returns:
+        是否成功发起打开动作
+    """
+    try:
+        target_str = str(target)
+        system = platform.system()
+
+        if system == "Windows":
+            os.startfile(target_str)
+        elif system == "Darwin":  # macOS
+            subprocess.Popen(["open", target_str])
+        else:  # Linux
+            subprocess.Popen(["xdg-open", target_str])
+        return True
+    except FileNotFoundError as e:
+        log.error(f"无法打开（路径不存在）: {e}")
+    except PermissionError as e:
+        log.error(f"无法打开（权限不足）: {e}")
+    except Exception as e:
+        log.error(f"无法打开: {type(e).__name__}: {e}")
+    return False
+
+
 def open_folder_cross_platform(path: Path) -> None:
     """
     跨平台打开文件夹。
@@ -235,22 +272,7 @@ def open_folder_cross_platform(path: Path) -> None:
     Args:
         path: 文件夹路径
     """
-    try:
-        path_str = str(path)
-        system = platform.system()
-
-        if system == "Windows":
-            os.startfile(path_str)
-        elif system == "Darwin":  # macOS
-            subprocess.Popen(["open", path_str])
-        else:  # Linux
-            subprocess.Popen(["xdg-open", path_str])
-    except FileNotFoundError as e:
-        log.error(f"无法打开文件夹（路径不存在）: {e}")
-    except PermissionError as e:
-        log.error(f"无法打开文件夹（权限不足）: {e}")
-    except Exception as e:
-        log.error(f"无法打开文件夹: {type(e).__name__}: {e}")
+    open_path_cross_platform(path)
 
 
 def get_log_dir() -> Path:

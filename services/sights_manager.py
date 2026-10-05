@@ -14,7 +14,7 @@
 - 外部资源/依赖:
   - 目录: UserSights（读写）
   - 文件: 炮镜目录内的 .blk 文件（扫描计数）、资源库封面文件（写入）
-  - 系统能力: zipfile/7z 解压、文件系统读写、os.startfile
+  - 系统能力: zipfile/7z 解压、文件系统读写、系统默认方式打开目录
 
 错误处理策略:
 - 文件操作使用具体的异常类型（PermissionError、FileNotFoundError 等）

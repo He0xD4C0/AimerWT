@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-开机自启动管理模组：负责 Windows 开机自启动设置。
+开机自启动管理模组：负责 Windows（注册表）与 macOS（LaunchAgent）开机自启动设置。
 
 功能特性:
 - 设置/取消开机自启动
 - 支持静默启动（只显示托盘）
-- 注册表操作
+- Windows: 注册表 Run 项；macOS: ~/Library/LaunchAgents/com.aimer.wt.plist
 
 错误处理策略:
-- 注册表操作使用 try-except 捕获异常
+- 注册表/plist 操作使用 try-except 捕获异常
 - 所有操作记录完整的错误上下文
 """
 import os
+import plistlib
 import sys
 import platform
 from pathlib import Path
@@ -22,6 +23,7 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 IS_WINDOWS = platform.system() == "Windows"
+IS_DARWIN = platform.system() == "Darwin"
 
 if IS_WINDOWS:
     import winreg
@@ -29,6 +31,9 @@ if IS_WINDOWS:
 # 注册表路径
 REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 REGISTRY_APP_NAME = "AimerWT"
+
+# macOS LaunchAgent 标识
+LAUNCH_AGENT_LABEL = "com.aimer.wt"
 
 
 class AutostartManager:
@@ -49,6 +54,85 @@ class AutostartManager:
         """
         self._app_name = app_name
         self._registry_key = REGISTRY_KEY
+
+    # --- macOS LaunchAgent 辅助 ---
+
+    @staticmethod
+    def _macos_app_bundle() -> Optional[Path]:
+        """打包运行时返回所在 .app bundle 路径。"""
+        if not getattr(sys, "frozen", False):
+            return None
+        executable = Path(sys.executable)
+        for candidate in (executable, *executable.parents):
+            if candidate.suffix == ".app":
+                return candidate
+        return None
+
+    @staticmethod
+    def _launch_agent_path() -> Path:
+        return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
+
+    def _macos_program_arguments(self, silent: bool) -> list[str] | None:
+        """构造 LaunchAgent 的启动命令。"""
+        bundle = self._macos_app_bundle()
+        if bundle is not None:
+            args = ["/usr/bin/open", "-a", str(bundle)]
+            if silent:
+                args.extend(["--args", "--silent"])
+            return args
+
+        main_script = Path(__file__).resolve().parent.parent / "main.py"
+        if not main_script.is_file():
+            return None
+        args = [sys.executable, str(main_script)]
+        if silent:
+            args.append("--silent")
+        return args
+
+    def _macos_is_enabled(self) -> bool:
+        return self._launch_agent_path().is_file()
+
+    def _macos_enable(self, silent: bool) -> bool:
+        try:
+            arguments = self._macos_program_arguments(silent)
+            if not arguments:
+                log.error("启用开机自启动失败：找不到可执行入口")
+                return False
+
+            plist_path = self._launch_agent_path()
+            plist_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "Label": LAUNCH_AGENT_LABEL,
+                "ProgramArguments": arguments,
+                "RunAtLoad": True,
+                "KeepAlive": False,
+            }
+            # 先写临时文件再替换，避免留下半截 plist
+            temp_path = plist_path.with_suffix(".plist.tmp")
+            with open(temp_path, "wb") as file_obj:
+                plistlib.dump(payload, file_obj)
+            os.replace(temp_path, plist_path)
+
+            mode_str = "静默模式" if silent else "正常模式"
+            log.info(f"已启用开机自启动 ({mode_str}): {plist_path}")
+            return True
+        except PermissionError as e:
+            log.error(f"启用开机自启动失败（权限不足）: {e}")
+            return False
+        except Exception as e:
+            log.error(f"启用开机自启动失败: {e}")
+            return False
+
+    def _macos_disable(self) -> bool:
+        try:
+            plist_path = self._launch_agent_path()
+            if plist_path.exists():
+                plist_path.unlink()
+            log.info("已禁用开机自启动")
+            return True
+        except Exception as e:
+            log.error(f"禁用开机自启动失败: {e}")
+            return False
 
     def _get_executable_path(self, silent: bool = False) -> str:
         """
@@ -82,6 +166,8 @@ class AutostartManager:
         Returns:
             是否已启用
         """
+        if IS_DARWIN:
+            return self._macos_is_enabled()
         if not IS_WINDOWS:
             return False
         try:
@@ -105,6 +191,8 @@ class AutostartManager:
         Returns:
             是否设置成功
         """
+        if IS_DARWIN:
+            return self._macos_enable(silent)
         if not IS_WINDOWS:
             log.warning("非 Windows 平台，不支持注册表方式的开机自启动")
             return False
@@ -132,6 +220,8 @@ class AutostartManager:
         Returns:
             是否禁用成功
         """
+        if IS_DARWIN:
+            return self._macos_disable()
         if not IS_WINDOWS:
             return True
         try:
@@ -174,6 +264,17 @@ class AutostartManager:
         Returns:
             注册表值，如果不存在返回 None
         """
+        if IS_DARWIN:
+            if not self._macos_is_enabled():
+                return None
+            try:
+                with open(self._launch_agent_path(), "rb") as file_obj:
+                    payload = plistlib.load(file_obj)
+                arguments = payload.get("ProgramArguments") or []
+                return " ".join(str(item) for item in arguments)
+            except Exception as e:
+                log.error(f"读取 LaunchAgent 失败: {e}")
+                return None
         if not IS_WINDOWS:
             return None
         try:

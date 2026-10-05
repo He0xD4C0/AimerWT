@@ -10,7 +10,7 @@
     <a href="#english">English</a> | <a href="https://github.com/AimerSo/Aimer_WT/issues">报告 Bug</a>
   </p>
   <p align="center">
-    <img src="https://img.shields.io/badge/Platform-Windows%20|%20Linux-0078D7?style=flat-square&logo=Windows" alt="Platform" />
+    <img src="https://img.shields.io/badge/Platform-Windows%20|%20Linux%20|%20macOS-0078D7?style=flat-square&logo=Windows" alt="Platform" />
     <img src="https://img.shields.io/badge/Language-Python-3776AB?style=flat-square&logo=Python&logoColor=white" alt="Language" />
     <img alt="license" src="https://img.shields.io/github/license/AimerSo/Aimer_WT?style=flat-square" />
     <br/>
@@ -43,7 +43,7 @@ AimerWT is a comprehensive, all-in-one resource management tool designed specifi
 
 ## 环境要求
 
-- Windows/Linux
+- Windows/Linux/macOS
 - Microsoft Edge WebView2 Runtime（Windows only）
 - Python（建议 3.10+，以你本地可运行版本为准）
 - 依赖：pywebview
@@ -54,6 +54,36 @@ AimerWT is a comprehensive, all-in-one resource management tool designed specifi
 - ✅ 支持手动选择路径与语音包管理
 
 > **注意**：Linux 用户需先安装 GTK 3、WebKitGTK 4.1 与对应的 Python GObject 依赖，再安装项目依赖。
+
+## 🍎 macOS 支持
+
+macOS 使用系统自带的 WKWebView（pywebview 的 Cocoa 后端），无需额外安装 GTK/WebView2：
+
+- ✅ 自动识别官方启动器与 Steam 两种安装（游戏本体位于 app bundle 内部）
+- ✅ 原生菜单栏图标（显示/隐藏窗口、退出），窗口可最小化到菜单栏
+- ✅ 支持开机自启动（写入 `~/Library/LaunchAgents`）
+- ✅ 应用数据统一放在 `~/Library/Application Support/AimerWT`，不写入 app 包内部
+
+**游戏目录说明**
+
+macOS 版游戏本体在 app bundle 内部，选择路径时可以直接选外层目录或 `.app`，程序会自动下钻：
+
+- 官方启动器：`/Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game`
+- Steam：`~/Library/Application Support/Steam/steamapps/common/War Thunder/WarThunder.app/Contents/Resources/game`
+
+**首次运行提示**
+
+macOS 构建产物为未签名（ad-hoc 签名）的 `.app`，从网络下载后如提示"已损坏"或"无法验证开发者"，可执行：
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/AimerWT V3.1 Beta.app"
+```
+
+或右键点击 App 选择"打开"。启动游戏时使用游戏自身的启动器/Steam 客户端（默认模式）。
+
+> **注意**：安装 mod 只写入 `sound/mod` 并修改 `config.blk`。实测 macOS 版游戏包体在安装前就已处于"资源封印不完整"状态（官方启动器会向包内写入文件），因此装 mod 不会额外改变 Gatekeeper 的判定；如遇游戏更新或启动异常，可用官方启动器或 Steam 的"校验文件完整性"修复。卸载 mod 后 `sound/mod` 会被清空，`config.blk` 的 `enable_mod` 会被置为 `no`。
+
+> **试听功能**：仓库内附带的 macOS 版 `vgmstream-cli` 依赖 Homebrew 动态库，需先执行 `brew install vorbis ffmpeg`；未安装时试听会提示"试听组件缺少系统依赖"，不影响其它功能。
 
 ## 快速开始（源码运行）
 
@@ -109,4 +139,3 @@ python main.py
 
 ## 许可协议
 本项目采用 GNU General Public License v3.0（GPL-3.0）开源，详见 `LICENSE` 文件。
-

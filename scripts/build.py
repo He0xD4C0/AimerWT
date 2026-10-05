@@ -53,6 +53,105 @@ def calculate_checksum(file_path, algorithm='sha256'):
     return hash_func.hexdigest()
 
 
+def calculate_directory_checksum(directory, algorithm='sha256'):
+    """对目录（macOS .app bundle）计算稳定校验和：按相对路径排序后逐个文件累加。"""
+    hash_func = getattr(hashlib, algorithm)()
+    root = Path(directory)
+    for path in sorted((item for item in root.rglob("*") if item.is_file()), key=lambda p: str(p.relative_to(root))):
+        hash_func.update(str(path.relative_to(root)).replace(os.sep, "/").encode("utf-8"))
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                hash_func.update(chunk)
+    return hash_func.hexdigest()
+
+
+def build_macos_icns(work_dir: Path) -> Path:
+    """由 web/assets/app_icon.ico 生成 .icns（Pillow + iconutil，不新增二进制资源）。"""
+    source = PROJECT_ROOT / "web" / "assets" / "app_icon.ico"
+    if not source.is_file():
+        raise RuntimeError(f"缺少 macOS 图标源文件: {source}")
+
+    try:
+        from PIL import Image
+    except Exception as exc:  # pragma: no cover - Pillow 是运行依赖
+        raise RuntimeError(f"生成 .icns 需要 Pillow: {exc}") from exc
+
+    iconset_dir = work_dir / f"{EXE_DISPLAY_NAME}.iconset"
+    iconset_dir.mkdir(parents=True, exist_ok=True)
+    icon_specs = (
+        (16, "icon_16x16.png"),
+        (32, "icon_16x16@2x.png"),
+        (32, "icon_32x32.png"),
+        (64, "icon_32x32@2x.png"),
+        (128, "icon_128x128.png"),
+        (256, "icon_128x128@2x.png"),
+        (256, "icon_256x256.png"),
+        (512, "icon_256x256@2x.png"),
+        (512, "icon_512x512.png"),
+        (1024, "icon_512x512@2x.png"),
+    )
+    with Image.open(source) as image:
+        base = image.convert("RGBA")
+        for size, name in icon_specs:
+            resized = base.resize((size, size), Image.LANCZOS)
+            resized.save(iconset_dir / name, format="PNG")
+
+    icns_path = work_dir / f"{EXE_DISPLAY_NAME}.icns"
+    try:
+        result = subprocess.run(
+            ["iconutil", "-c", "icns", str(iconset_dir), "-o", str(icns_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError("macOS 构建环境缺少 iconutil 命令") from exc
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"生成 .icns 失败: {(exc.stderr or exc.stdout or '').strip()}") from exc
+
+    if not icns_path.is_file():
+        raise RuntimeError("生成 .icns 失败：输出文件不存在")
+    return icns_path
+
+
+def finalize_macos_bundle(bundle_path: Path) -> None:
+    """写入版本号并重新做 ad-hoc 签名（PyInstaller CLI 无法直接设置 CFBundleVersion）。"""
+    bundle_path = Path(bundle_path)
+    info_plist = bundle_path / "Contents" / "Info.plist"
+    if not info_plist.is_file():
+        raise RuntimeError(f"未找到 macOS Info.plist: {info_plist}")
+
+    for key in ("CFBundleShortVersionString", "CFBundleVersion"):
+        try:
+            subprocess.run(
+                ["/usr/bin/plutil", "-replace", key, "-string", APP_VERSION, str(info_plist)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"写入 Info.plist 失败({key}): {(exc.stderr or '').strip()}") from exc
+
+    # Info.plist 变更会使原签名失效，需要重新签名并校验
+    try:
+        subprocess.run(
+            ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(bundle_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"macOS 重新签名失败: {(exc.stderr or '').strip()}") from exc
+
+    verify = subprocess.run(
+        ["/usr/bin/codesign", "--verify", "--all-architectures", "--deep", "--strict", str(bundle_path)],
+        capture_output=True,
+        text=True,
+    )
+    if verify.returncode != 0:
+        raise RuntimeError(f"macOS 签名校验失败: {(verify.stderr or verify.stdout or '').strip()}")
+
+
 def clean_build_artifacts():
     """清理构建临时文件"""
     log.info("🧹 正在清理临时文件...")
@@ -359,21 +458,17 @@ def build_exe():
         version_file = Path(tmp_dir) / "version_info.txt"
         write_version_info(version_file)
 
+        is_macos = sys.platform == "darwin"
+
         cmd = [
             sys.executable, "-m", "PyInstaller",
             "--noconsole",
-            "--onefile",
+            # macOS 上 onefile 与 .app bundle 冲突（PyInstaller 7 直接报错），改用 onedir
+            "--onedir" if is_macos else "--onefile",
             "--add-data", f"{web_pack_dir}{sep}web",
             "--name", EXE_DISPLAY_NAME,
             "--clean",
-            # hidden imports：确保 pywebview 各后端、pystray、pythonnet 均被打包
-            "--hidden-import", "webview.platforms.edgechromium",
-            "--hidden-import", "webview.platforms.winforms",
-            "--hidden-import", "webview.platforms.cef",
-            "--hidden-import", "webview.platforms.gtk",
-            "--hidden-import", "clr",
-            "--hidden-import", "clr_loader",
-            "--hidden-import", "pystray._win32",
+            # hidden imports：确保 pywebview 后端、pystray 等均被打包
             "--hidden-import", "PIL._imaging",
             "--hidden-import", "PIL.Image",
             "--hidden-import", "PIL.IcoImagePlugin",
@@ -387,6 +482,26 @@ def build_exe():
             "--collect-all", "pystray",
             "main.py"
         ]
+
+        if is_macos:
+            cmd.extend([
+                "--hidden-import", "webview.platforms.cocoa",
+                "--hidden-import", "pystray._darwin",
+                "--hidden-import", "objc",
+                "--hidden-import", "AppKit",
+                "--hidden-import", "Foundation",
+                "--hidden-import", "PyObjCTools",
+            ])
+        else:
+            cmd.extend([
+                "--hidden-import", "webview.platforms.edgechromium",
+                "--hidden-import", "webview.platforms.winforms",
+                "--hidden-import", "webview.platforms.cef",
+                "--hidden-import", "webview.platforms.gtk",
+                "--hidden-import", "clr",
+                "--hidden-import", "clr_loader",
+                "--hidden-import", "pystray._win32",
+            ])
 
         catalog_json = PROJECT_ROOT / "services" / "sight_vehicle_catalog.json"
         if not catalog_json.is_file():
@@ -404,14 +519,26 @@ def build_exe():
             cmd.extend(["--icon", str(PROJECT_ROOT / "web" / "assets" / "app_icon.ico")])
             cmd.extend(["--version-file", str(version_file)])
             log.info(f"已生成版本资源文件: {version_file}")
+        elif is_macos:
+            icns_path = build_macos_icns(Path(tmp_dir))
+            cmd.extend(["--icon", str(icns_path)])
+            cmd.extend(["--osx-bundle-identifier", "com.aimer.wt"])
+            log.info(f"已生成 macOS 图标: {icns_path}")
         else:
             cmd.append("--strip")
 
         log.info(f"执行命令: {' '.join(cmd)}")
 
+        run_env = os.environ.copy()
+        if is_macos:
+            # 让 PyInstaller 校验 ad-hoc 签名，避免产出无法启动的 .app
+            run_env["PYINSTALLER_VERIFY_BUNDLE_SIGNATURE"] = "1"
+
         try:
             # shell=False ensures arguments are passed correctly on Linux without manual escaping
-            result = subprocess.run(cmd, cwd=PROJECT_ROOT, check=True, capture_output=True, text=True)
+            result = subprocess.run(
+                cmd, cwd=PROJECT_ROOT, check=True, capture_output=True, text=True, env=run_env
+            )
             if result.stdout:
                 log.debug(result.stdout)
             if result.stderr:
@@ -429,8 +556,16 @@ def build_exe():
             log.exception(f"[X] 打包失败！错误: {e}")
             sys.exit(1)
         else:
-            exe_name = f"{EXE_DISPLAY_NAME}.exe" if os.name == 'nt' else EXE_DISPLAY_NAME
+            if os.name == 'nt':
+                exe_name = f"{EXE_DISPLAY_NAME}.exe"
+            elif is_macos:
+                exe_name = f"{EXE_DISPLAY_NAME}.app"
+            else:
+                exe_name = EXE_DISPLAY_NAME
             exe_path = dist_dir / exe_name
+            if is_macos:
+                finalize_macos_bundle(exe_path)
+                log.info("已写入 macOS 版本号并完成 ad-hoc 签名校验")
             log.info("[OK] 打包成功！")
             log.info(f"输出文件: {exe_path}")
             return True
@@ -442,7 +577,12 @@ def main():
         return
 
     # 2. 生成校验文件
-    exe_name = f"{EXE_DISPLAY_NAME}.exe" if os.name == 'nt' else EXE_DISPLAY_NAME
+    if os.name == 'nt':
+        exe_name = f"{EXE_DISPLAY_NAME}.exe"
+    elif sys.platform == "darwin":
+        exe_name = f"{EXE_DISPLAY_NAME}.app"
+    else:
+        exe_name = EXE_DISPLAY_NAME
     dist_dir = PROJECT_ROOT / "dist"
     exe_path = dist_dir / exe_name
 
@@ -451,7 +591,10 @@ def main():
         return
 
     log.info("🔐 正在生成校验文件...")
-    checksum = calculate_checksum(exe_path, 'sha256')
+    if exe_path.is_dir():
+        checksum = calculate_directory_checksum(exe_path, 'sha256')
+    else:
+        checksum = calculate_checksum(exe_path, 'sha256')
     checksum_file = dist_dir / Path("checksum.txt")
 
     with open(checksum_file, 'w', encoding='utf-8') as f:

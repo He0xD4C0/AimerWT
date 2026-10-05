@@ -11,11 +11,19 @@ import tempfile
 import wave
 from pathlib import Path
 
+from utils.logger import get_logger
+
+log = get_logger(__name__)
+
 
 class BankPreviewService:
-    def __init__(self, base_dir: Path):
+    def __init__(self, base_dir: Path, cache_dir: Path | None = None):
         self.base_dir = Path(base_dir)
-        self.cache_dir = self.base_dir / "cache" / "preview_audio"
+        # 预览缓存是运行期数据：macOS 下需要放在应用数据目录，
+        # 避免写进只读语义的 .app bundle。
+        self.cache_dir = (
+            Path(cache_dir) if cache_dir else self.base_dir / "cache" / "preview_audio"
+        )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._streams_cache: dict[str, list[dict]] = {}
 
@@ -185,8 +193,7 @@ class BankPreviewService:
             cmd.extend(["-o", str(wav_file), str(fsb_file)])
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             if proc.returncode != 0 or not wav_file.exists():
-                stderr = (proc.stderr or "").strip()
-                raise RuntimeError(stderr or "bank 解析失败，文件不正确")
+                raise RuntimeError(self._describe_vgmstream_failure(proc.stderr))
 
             return wav_file.read_bytes()
 
@@ -202,10 +209,18 @@ class BankPreviewService:
             cmd = [str(vgmstream), "-I", "-S", "0", str(fsb_file)]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             if proc.returncode != 0:
-                stderr = (proc.stderr or "").strip()
-                raise RuntimeError(stderr or "bank 解析失败，文件不正确")
+                raise RuntimeError(self._describe_vgmstream_failure(proc.stderr))
             lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
             return [ln for ln in lines if ln.startswith("{") and ln.endswith("}")]
+
+    @staticmethod
+    def _describe_vgmstream_failure(stderr: str) -> str:
+        """把 vgmstream 的底层报错转成可操作的提示。"""
+        detail = str(stderr or "").strip()
+        if "Library not loaded" in detail or "dyld" in detail:
+            # macOS 仓库内的 vgmstream-cli 依赖 Homebrew 动态库
+            return "试听组件缺少系统依赖：macOS 需先执行 brew install vorbis ffmpeg"
+        return detail or "bank 解析失败，文件不正确"
 
     @staticmethod
     def _trim_wav_bytes(wav_bytes: bytes, max_seconds: int) -> bytes:
@@ -253,7 +268,15 @@ class BankPreviewService:
         for p in candidates:
             if p.exists() and p.is_file():
                 if os.name != "nt" and not os.access(p, os.X_OK):
-                    continue
+                    # 仓库/打包产物里的可执行位可能在 Windows 上丢失（提交为 644），
+                    # 运行时补上，与 tools/7zip 的处理方式保持一致。
+                    try:
+                        p.chmod(p.stat().st_mode | 0o755)
+                    except OSError as e:
+                        log.warning(f"无法为 vgmstream-cli 添加执行权限: {p} ({e})")
+                        continue
+                    if not os.access(p, os.X_OK):
+                        continue
                 return p
         return None
 

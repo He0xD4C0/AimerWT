@@ -37,6 +37,120 @@ from utils.logger import get_logger
 log = get_logger(__name__)
 
 
+# War Thunder 根目录标识文件（跨平台）
+WT_ROOT_MARKERS = ("config.blk", "beac_wt_mlauncher.exe", "gaijin_downloader.exe")
+
+# macOS 下游戏可能被包裹在 app bundle 内，按顺序尝试这些相对路径定位真正的根目录
+MACOS_GAME_ROOT_SUBPATHS = (
+    "",
+    "game",
+    "Resources/game",
+    "Contents/Resources/game",
+    "WarThunder.app/Contents/Resources/game",
+    "Contents/WarThunder.app/Contents/Resources/game",
+    "WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game",
+    "steamapps/common/War Thunder",
+    "steamapps/common/War Thunder/WarThunder.app/Contents/Resources/game",
+)
+
+# macOS 下常见的 bundle / 目录名，用于在父目录里继续下钻
+MACOS_GAME_BUNDLE_NAMES = (
+    "WarThunder.app",
+    "WarThunderLauncher.app",
+    "War Thunder",
+    "WarThunder",
+)
+
+
+def path_is_wt_root(path: Path | str) -> bool:
+    """判断给定目录是否直接包含 War Thunder 根目录标识文件（只读检查）。"""
+    try:
+        target = Path(path)
+        if not (target.exists() and target.is_dir()):
+            return False
+        return any((target / marker).exists() for marker in WT_ROOT_MARKERS)
+    except Exception:
+        return False
+
+
+def resolve_macos_game_root(path: Path | str) -> Path:
+    """
+    将 macOS 上用户选中的路径规范化为真正的游戏根目录。
+
+    macOS 版本的游戏通常位于 app bundle 内部，例如：
+    - Steam: <Steam库>/steamapps/common/War Thunder/WarThunder.app/Contents/Resources/game
+    - 官方启动器: /Applications/WarThunderLauncher.app/Contents/WarThunder.app/Contents/Resources/game
+
+    允许传入外层安装目录、app bundle 本身，或已经指向 game 的路径；无法识别时原样返回。
+    """
+    try:
+        base = Path(path).expanduser()
+    except Exception:
+        return Path(path)
+
+    if not (base.exists() and base.is_dir()):
+        return base
+
+    def _first_match(root: Path) -> Path | None:
+        for relative in MACOS_GAME_ROOT_SUBPATHS:
+            candidate = root / relative if relative else root
+            if path_is_wt_root(candidate):
+                return candidate
+        return None
+
+    match = _first_match(base)
+    if match is not None:
+        return match
+
+    try:
+        children = sorted(
+            (child for child in base.iterdir() if child.is_dir()),
+            key=lambda item: item.name.lower(),
+        )
+    except OSError:
+        return base
+
+    for child in children:
+        if child.name not in MACOS_GAME_BUNDLE_NAMES:
+            continue
+        match = _first_match(child)
+        if match is not None:
+            return match
+
+    return base
+
+
+def select_macos_game_root(candidates: list[Path] | tuple[Path, ...]) -> Path | None:
+    """
+    从多个候选中挑出最可能正在使用的游戏根目录。
+
+    同时存在 Steam 版与官方启动器版时，取 config.blk 最近被改动的那一个
+    （游戏启动或修改设置都会重写 config.blk）；完全相同时保留候选顺序。
+    """
+    found: list[tuple[float, int, Path]] = []
+    seen: set[str] = set()
+    for index, candidate in enumerate(candidates):
+        resolved = resolve_macos_game_root(candidate)
+        if not path_is_wt_root(resolved):
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            mtime = (resolved / "config.blk").stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        found.append((mtime, -index, resolved))
+
+    if not found:
+        return None
+    found.sort(reverse=True)
+    for mtime, _neg_index, path in found:
+        log.info("[CANDIDATE] macOS 游戏安装: %s (config.blk mtime=%s)", path, mtime)
+    return found[0][2]
+
+
 class CoreServiceError(Exception):
     """CoreService 相关错误的基类。"""
     pass
@@ -94,10 +208,15 @@ class CoreService:
         if not path.is_dir():
             log.warning(f"游戏路径校验失败: 不是目录 - {path}")
             return False, "路径不是目录"
-        
-        valid_markers = ["config.blk", "beac_wt_mlauncher.exe", "gaijin_downloader.exe"]
-        has_marker = any((path / marker).exists() for marker in valid_markers)
-        if not has_marker:
+
+        # macOS：允许用户选择外层安装目录或 app bundle，自动下钻到真正的游戏根
+        if sys.platform == "darwin":
+            resolved = resolve_macos_game_root(path)
+            if resolved != path and path_is_wt_root(resolved):
+                log.info(f"已将 macOS 游戏路径规范化为: {resolved}")
+                path = resolved
+
+        if not path_is_wt_root(path):
             log.warning(f"游戏路径校验失败: 缺少有效标识文件 - {path}")
             return False, "缺少游戏标识文件"
         
@@ -301,6 +420,70 @@ class CoreService:
                 
         return None
 
+    def get_macos_game_paths(self):
+        """
+        功能定位:
+        - 在 macOS 主机上自动定位 War Thunder 安装目录。
+
+        输入输出:
+        - 参数: 无
+        - 返回:
+          - str | None，找到则返回游戏根目录路径字符串（已下钻到 app bundle 内部），否则返回 None。
+        - 外部资源/依赖:
+          - Steam 用户库（~/Library/Application Support/Steam 及 libraryfolders.vdf 中登记的库）
+          - Gaijin 官方启动器（/Applications、~/Applications 下的 WarThunderLauncher.app）
+        """
+
+        log.info("[SEARCH] 开始检索 macOS 游戏安装...")
+        home = Path.home()
+        candidates: list[Path] = []
+
+        def _add(candidate: Path) -> None:
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        # 1. Steam：默认库 + libraryfolders.vdf 登记的其它库
+        steam_roots = [
+            home / "Library" / "Application Support" / "Steam",
+        ]
+        for root in list(steam_roots):
+            for vdf_path in (
+                root / "steamapps" / "libraryfolders.vdf",
+                root / "config" / "libraryfolders.vdf",
+            ):
+                if not vdf_path.exists():
+                    continue
+                try:
+                    content = vdf_path.read_text(encoding="utf-8", errors="ignore")
+                    steam_roots.extend(
+                        Path(found) for found in re.findall(r'"path"\s+"([^"]+)"', content)
+                    )
+                except Exception as e:
+                    log.debug(f"解析 macOS Steam 库配置失败/跳过: {e}")
+
+        for root in steam_roots:
+            _add(root)
+            _add(root / "steamapps" / "common" / "War Thunder")
+
+        # 2. Gaijin 官方启动器（游戏本体位于启动器 bundle 内部）
+        app_bases = [Path("/Applications"), home / "Applications"]
+        for base in app_bases:
+            _add(base / "WarThunderLauncher.app")
+            _add(base / "WarThunder.app")
+            _add(base / "War Thunder")
+
+        # 3. 常见兜底路径
+        _add(home / "WarThunder")
+        _add(home / "War Thunder")
+
+        # 4. 逐个规范化并校验；多个安装同时存在时，优先取最近使用过的那一个
+        best = select_macos_game_root(candidates)
+        if best is None:
+            log.warning("[FAIL] macOS 未自动找到游戏路径。")
+            return None
+        log.info(f"[FOUND] macOS 游戏路径: {best}")
+        return str(best)
+
     def auto_detect_game_path(self):
         """
         功能定位:
@@ -316,6 +499,8 @@ class CoreService:
             return self.get_windows_game_paths()
         elif sys.platform == "linux":
             return self.get_linux_game_paths()
+        elif sys.platform == "darwin":
+            return self.get_macos_game_paths()
 
     def _check_is_wt_dir(self, path: Path) -> bool:
         """
