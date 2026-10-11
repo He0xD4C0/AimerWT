@@ -509,8 +509,14 @@ def _clean_runtime_env() -> dict[str, str]:
 
 def _run_cli_help(cli: Path) -> None:
     result = _run((cli, "-h"), env=_clean_runtime_env(), timeout=30, check=False)
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()
+    # vgmstream r2117 deliberately exits 1 after printing its complete help
+    # text.  Treat that as a successful smoke test only when the expected
+    # usage output proves the relocated executable actually started; do not
+    # mask dyld/loader failures that also commonly return 1.
+    output = f"{result.stdout or ''}\n{result.stderr or ''}"
+    has_help_output = "Usage:" in output and "-h: print all commands" in output
+    if result.returncode not in {0, 1} or not has_help_output:
+        detail = output.strip()
         raise RuntimeBuildError(f"干净环境下 vgmstream-cli -h 失败: {detail}")
 
 
