@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import subprocess
+import sys
 import tempfile
 import wave
 from pathlib import Path
@@ -179,7 +180,7 @@ class BankPreviewService:
     def _decode_fsb_to_wav(self, fsb_bytes: bytes, stream_index: int | None = None) -> bytes:
         vgmstream = self._find_vgmstream_cli()
         if not vgmstream:
-            raise RuntimeError("缺少 vgmstream-cli，无法试听")
+            raise RuntimeError(self._missing_vgmstream_message())
 
         with tempfile.TemporaryDirectory(prefix="aimer_preview_") as td:
             td_path = Path(td)
@@ -200,7 +201,7 @@ class BankPreviewService:
     def _probe_fsb_streams(self, fsb_bytes: bytes) -> list[str]:
         vgmstream = self._find_vgmstream_cli()
         if not vgmstream:
-            raise RuntimeError("缺少 vgmstream-cli，无法试听")
+            raise RuntimeError(self._missing_vgmstream_message())
 
         with tempfile.TemporaryDirectory(prefix="aimer_probe_") as td:
             td_path = Path(td)
@@ -214,11 +215,22 @@ class BankPreviewService:
             return [ln for ln in lines if ln.startswith("{") and ln.endswith("}")]
 
     @staticmethod
-    def _describe_vgmstream_failure(stderr: str) -> str:
+    def _is_frozen_macos() -> bool:
+        return sys.platform == "darwin" and bool(getattr(sys, "frozen", False))
+
+    def _missing_vgmstream_message(self) -> str:
+        if self._is_frozen_macos():
+            return "macOS 试听组件不完整，请重新下载完整 AimerWT app"
+        return "缺少 vgmstream-cli，无法试听"
+
+    def _describe_vgmstream_failure(self, stderr: str) -> str:
         """把 vgmstream 的底层报错转成可操作的提示。"""
         detail = str(stderr or "").strip()
         if "Library not loaded" in detail or "dyld" in detail:
-            # macOS 仓库内的 vgmstream-cli 依赖 Homebrew 动态库
+            if self._is_frozen_macos():
+                return "macOS 试听组件不完整，请重新下载完整 AimerWT app"
+            # 源码开发仍允许使用仓库内的 Homebrew 依赖 CLI；发布 .app 则只
+            # 使用自包含 Frameworks 运行时，不要求终端用户安装 Homebrew。
             return "试听组件缺少系统依赖：macOS 需先执行 brew install vorbis ffmpeg"
         return detail or "bank 解析失败，文件不正确"
 
@@ -246,6 +258,17 @@ class BankPreviewService:
         return f"data:audio/wav;base64,{b64}"
 
     def _find_vgmstream_cli(self) -> Path | None:
+        if self._is_frozen_macos():
+            # PyInstaller 的 BASE_DIR 指向 _MEIPASS；发布时必须以实际 app
+            # bundle 的 Contents/Frameworks 为准，不能回退到旧 tools 副本。
+            frozen_runtime = (
+                Path(sys.executable).resolve().parent.parent
+                / "Frameworks"
+                / "AimerWTVgmstream"
+                / "vgmstream-cli"
+            )
+            return self._usable_vgmstream_cli(frozen_runtime)
+
         system_name = platform.system().lower()
         platform_dirs = {
             "windows": "windows",
@@ -266,19 +289,27 @@ class BankPreviewService:
             )
 
         for p in candidates:
-            if p.exists() and p.is_file():
-                if os.name != "nt" and not os.access(p, os.X_OK):
-                    # 仓库/打包产物里的可执行位可能在 Windows 上丢失（提交为 644），
-                    # 运行时补上，与 tools/7zip 的处理方式保持一致。
-                    try:
-                        p.chmod(p.stat().st_mode | 0o755)
-                    except OSError as e:
-                        log.warning(f"无法为 vgmstream-cli 添加执行权限: {p} ({e})")
-                        continue
-                    if not os.access(p, os.X_OK):
-                        continue
-                return p
+            usable = self._usable_vgmstream_cli(p)
+            if usable:
+                return usable
         return None
+
+    @staticmethod
+    def _usable_vgmstream_cli(candidate: Path) -> Path | None:
+        """确保现有源码工具和发布包内 CLI 都可由子进程执行。"""
+        if not candidate.exists() or not candidate.is_file():
+            return None
+        if os.name != "nt" and not os.access(candidate, os.X_OK):
+            # 仓库/打包产物里的可执行位可能在 Windows 上丢失（提交为 644），
+            # 运行时补上，与 tools/7zip 的处理方式保持一致。
+            try:
+                candidate.chmod(candidate.stat().st_mode | 0o755)
+            except OSError as e:
+                log.warning(f"无法为 vgmstream-cli 添加执行权限: {candidate} ({e})")
+                return None
+            if not os.access(candidate, os.X_OK):
+                return None
+        return candidate
 
     def clear_cache(self) -> int:
         removed = 0

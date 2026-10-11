@@ -59,6 +59,7 @@ AimerWT is a comprehensive, all-in-one resource management tool designed specifi
 
 macOS 使用系统自带的 WKWebView（pywebview 的 Cocoa 后端），无需额外安装 GTK/WebView2：
 
+- ✅ 最低支持 macOS 15；Intel（amd64）与 Apple Silicon（arm64）分别构建、分别发布，请下载与本机 CPU 对应的 zip
 - ✅ 自动识别官方启动器与 Steam 两种安装（游戏本体位于 app bundle 内部）
 - ✅ 原生菜单栏图标（显示/隐藏窗口、退出），窗口可最小化到菜单栏
 - ✅ 支持开机自启动（写入 `~/Library/LaunchAgents`）
@@ -73,7 +74,7 @@ macOS 版游戏本体在 app bundle 内部，选择路径时可以直接选外�
 
 **首次运行提示**
 
-macOS 构建产物为未签名（ad-hoc 签名）的 `.app`，从网络下载后如提示"已损坏"或"无法验证开发者"，可执行：
+macOS 构建产物只包含 ad-hoc 签名，并非 Developer ID 签名；本 PR 不包含 Developer ID、公证（notarization）或 stapling。从网络下载后如提示"已损坏"或"无法验证开发者"，可执行：
 
 ```bash
 xattr -dr com.apple.quarantine "/Applications/AimerWT V3.1 Beta.app"
@@ -83,7 +84,20 @@ xattr -dr com.apple.quarantine "/Applications/AimerWT V3.1 Beta.app"
 
 > **注意**：安装 mod 只写入 `sound/mod` 并修改 `config.blk`。实测 macOS 版游戏包体在安装前就已处于"资源封印不完整"状态（官方启动器会向包内写入文件），因此装 mod 不会额外改变 Gatekeeper 的判定；如遇游戏更新或启动异常，可用官方启动器或 Steam 的"校验文件完整性"修复。卸载 mod 后 `sound/mod` 会被清空，`config.blk` 的 `enable_mod` 会被置为 `no`。
 
-> **试听功能**：仓库内附带的 macOS 版 `vgmstream-cli` 依赖 Homebrew 动态库，需先执行 `brew install vorbis ffmpeg`；未安装时试听会提示"试听组件缺少系统依赖"，不影响其它功能。
+> **试听功能（发布包）**：macOS `.app` 会把当前架构的 `vgmstream-cli` 及其全部非系统动态库封入 `Contents/Frameworks/AimerWTVgmstream`，试听不需要用户安装 Homebrew。运行时内的 `third-party-manifest.json` 记录固定 vgmstream r2117 源提交、每个 dylib 的版本/来源/SHA-256 和许可证文本。
+
+源码开发仍可使用仓库内工具；如需构建可发布的 macOS app，请先在本机当前架构生成运行时，再把其路径传给打包步骤：
+
+```bash
+python scripts/build_macos_vgmstream_runtime.py \
+  --work-dir "$TMPDIR/aimerwt-vgmstream-build" \
+  --output-dir "$TMPDIR/aimerwt-vgmstream-runtime" \
+  --install-dependencies
+export AIMERWT_MACOS_VGMSTREAM_RUNTIME="$TMPDIR/aimerwt-vgmstream-runtime"
+python scripts/build.py
+```
+
+CI 会在 Intel 与 Apple Silicon runner 上分别执行这一步，并校验 app 与解压后的 release zip；发布包如果提示试听组件不完整，应重新下载完整 app，而不是安装 Homebrew。
 
 ## 快速开始（源码运行）
 

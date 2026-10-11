@@ -3,6 +3,8 @@ name: Build
 on:
   push:
     branches: [ "**" ]
+    # Fork 的开发发布候选只接受 dev-vX.Y.Z tag；精确格式由 job 内校验。
+    tags: [ "dev-v*.*.*" ]
   workflow_dispatch:
 
 permissions:
@@ -11,7 +13,13 @@ permissions:
 jobs:
   build:
     name: Build on ${{ matrix.os }} (${{ matrix.arch }})
-    if: github.repository == 'AimerSo/AimerWT'
+    # 主仓库保留原有的分支/手动构建；fork 仅允许明确的开发 tag，避免
+    # 任意分支 push 消耗完整跨平台矩阵。Release workflow 仍仅主仓库可用。
+    if: >-
+      (github.repository == 'AimerSo/AimerWT' && github.ref_type != 'tag') ||
+      (github.repository == 'He0xD4C0/AimerWT' &&
+       github.ref_type == 'tag' &&
+       startsWith(github.ref_name, 'dev-v'))
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -35,12 +43,22 @@ jobs:
             arch: amd64
             python-arch: x64
           # macOS arm64 (Apple Silicon)
-          - os: macos-latest
+          - os: macos-15
             arch: arm64
             python-arch: arm64
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Validate fork development tag
+      if: github.repository == 'He0xD4C0/AimerWT'
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [[ ! "$GITHUB_REF_NAME" =~ ^dev-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          echo "Fork CI requires a tag in dev-vX.Y.Z form; got: $GITHUB_REF_NAME"
+          exit 1
+        fi
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -59,9 +77,25 @@ jobs:
         python -m pip install --upgrade pip
         pip install -r requirements.txt
 
+    - name: Build bundled macOS vgmstream runtime
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        runtime_dir="$RUNNER_TEMP/aimerwt-vgmstream-runtime"
+        python scripts/build_macos_vgmstream_runtime.py \
+          --work-dir "$RUNNER_TEMP/aimerwt-vgmstream-build" \
+          --output-dir "$runtime_dir" \
+          --arch "${{ matrix.arch }}" \
+          --install-dependencies
+        echo "AIMERWT_MACOS_VGMSTREAM_RUNTIME=$runtime_dir" >> "$GITHUB_ENV"
+
     - name: Build
       env:
         PYTHONIOENCODING: utf-8
+        # 只允许 fork 的 dev-vX.Y.Z tag 生成不含遥测配置的验收包；
+        # 主仓库空 Secrets 仍会由 build.py 拒绝。
+        AIMERWT_ALLOW_MISSING_BUILD_SECRETS: ${{ github.repository == 'He0xD4C0/AimerWT' && '1' || '' }}
         REPORT_URL: ${{ secrets.REPORT_URL }}
         TELEMETRY_CLIENT_SECRET: ${{ secrets.TELEMETRY_CLIENT_SECRET }}
         TELEMETRY_SALT: ${{ secrets.TELEMETRY_SALT }}
@@ -126,7 +160,34 @@ jobs:
         BUNDLE_EXECUTABLE="$APP_PATH/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist")"
         /usr/bin/codesign --verify --all-architectures --deep --strict "$APP_PATH"
         "$BUNDLE_EXECUTABLE" --self-test
+        python scripts/verify_macos_vgmstream_bundle.py \
+          --app "$APP_PATH" \
+          --arch "${{ matrix.arch }}"
         echo "macOS self-test passed: $BUNDLE_EXECUTABLE"
+
+    - name: Verify macOS release archive
+      if: runner.os == 'macOS'
+      shell: bash
+      run: |
+        set -euo pipefail
+        archive="release-assets/AimerWT_V3.1_Beta_macOS_${{ matrix.arch }}.zip"
+        if [ ! -s "$archive" ]; then
+          echo "Missing macOS release archive: $archive"
+          exit 1
+        fi
+        unpack_dir="$RUNNER_TEMP/aimerwt-release-${{ matrix.arch }}"
+        mkdir -p "$unpack_dir"
+        ditto -x -k "$archive" "$unpack_dir"
+        app_count="$(find "$unpack_dir" -maxdepth 1 -type d -name '*.app' | wc -l | tr -d ' ')"
+        if [ "$app_count" != "1" ]; then
+          echo "Expected one .app after release archive extraction, found $app_count"
+          find "$unpack_dir" -maxdepth 2 -print
+          exit 1
+        fi
+        APP_PATH="$(find "$unpack_dir" -maxdepth 1 -type d -name '*.app' -print -quit)"
+        python scripts/verify_macos_vgmstream_bundle.py \
+          --app "$APP_PATH" \
+          --arch "${{ matrix.arch }}"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4

@@ -12,6 +12,12 @@ from datetime import datetime
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from scripts.build_macos_vgmstream_runtime import (
+    RuntimeBuildError,
+    normalize_architecture,
+    refresh_runtime_manifest_hashes,
+    validate_runtime_directory,
+)
 from utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -28,20 +34,20 @@ REQUIRED_BUILD_ENV_VARS = (
     "TELEMETRY_SALT",
 )
 
-REQUIRED_UNTRACKED_THEME_FILES = (
-    "bi_an.json",
-    "beiku.json",
-    "lianying.json",
-    "chifeng.json",
-    "wuye_fuyin.json",
-    "zqrx_mifuyu.json",
-    "supporter.json",
-    "DaiSongSong.json",
-)
+# 只供 fork 的开发 tag CI 显式开启。占位 URL 会被 telemetry_manager
+# 识别为禁用遥测，不能替代任何正式发布环境的真实配置。
+ALLOW_MISSING_BUILD_SECRETS_ENV = "AIMERWT_ALLOW_MISSING_BUILD_SECRETS"
+DEVELOPMENT_BUILD_SECRET_DEFAULTS = {
+    "REPORT_URL": "https://api.example.com/telemetry",
+    "TELEMETRY_CLIENT_SECRET": "",
+    "TELEMETRY_SALT": "",
+}
 
 REQUIRED_UNTRACKED_WEB_FILES = (
     "components/ResourceLibraryLoading.js",
 )
+
+MACOS_VGMSTREAM_RUNTIME_ENV = "AIMERWT_MACOS_VGMSTREAM_RUNTIME"
 
 
 def calculate_checksum(file_path, algorithm='sha256'):
@@ -114,7 +120,7 @@ def build_macos_icns(work_dir: Path) -> Path:
     return icns_path
 
 
-def finalize_macos_bundle(bundle_path: Path) -> None:
+def finalize_macos_bundle(bundle_path: Path, runtime_dir: Path | None = None) -> None:
     """写入版本号并重新做 ad-hoc 签名（PyInstaller CLI 无法直接设置 CFBundleVersion）。"""
     bundle_path = Path(bundle_path)
     info_plist = bundle_path / "Contents" / "Info.plist"
@@ -132,7 +138,8 @@ def finalize_macos_bundle(bundle_path: Path) -> None:
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(f"写入 Info.plist 失败({key}): {(exc.stderr or '').strip()}") from exc
 
-    # Info.plist 变更会使原签名失效，需要重新签名并校验
+    # Info.plist 变更会使原签名失效，需要重新签名并校验。先深度签名
+    # 所有嵌套代码；其中的 Mach-O 会新增/更新 LC_CODE_SIGNATURE。
     try:
         subprocess.run(
             ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(bundle_path)],
@@ -143,6 +150,33 @@ def finalize_macos_bundle(bundle_path: Path) -> None:
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"macOS 重新签名失败: {(exc.stderr or '').strip()}") from exc
 
+    if runtime_dir is not None:
+        try:
+            # 嵌套代码签名改变 CLI/dylib 字节，先刷新随包第三方清单的哈希，
+            # 再深度签名一次以重新封存 Frameworks 内的清单。ad-hoc 签名对
+            # 已签名且未变的嵌套 Mach-O 是稳定的；随后再次校验清单哈希。
+            refresh_runtime_manifest_hashes(runtime_dir)
+            validate_runtime_directory(
+                runtime_dir,
+                expected_arch=normalize_architecture(),
+                require_manifest=True,
+            )
+            subprocess.run(
+                ["/usr/bin/codesign", "--force", "--deep", "--sign", "-", str(bundle_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            validate_runtime_directory(
+                runtime_dir,
+                expected_arch=normalize_architecture(),
+                require_manifest=True,
+            )
+        except RuntimeBuildError as exc:
+            raise RuntimeError(f"刷新 macOS 试听运行时清单失败: {exc}") from exc
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"macOS bundle 重新签名失败: {(exc.stderr or '').strip()}") from exc
+
     verify = subprocess.run(
         ["/usr/bin/codesign", "--verify", "--all-architectures", "--deep", "--strict", str(bundle_path)],
         capture_output=True,
@@ -150,6 +184,69 @@ def finalize_macos_bundle(bundle_path: Path) -> None:
     )
     if verify.returncode != 0:
         raise RuntimeError(f"macOS 签名校验失败: {(verify.stderr or verify.stdout or '').strip()}")
+
+
+def resolve_macos_vgmstream_runtime() -> Path:
+    """读取并预检由 macOS 专用构建器生成的自包含试听运行时。"""
+    raw_runtime_dir = os.environ.get(MACOS_VGMSTREAM_RUNTIME_ENV, "").strip()
+    if not raw_runtime_dir:
+        raise RuntimeError(
+            f"macOS 打包需要 {MACOS_VGMSTREAM_RUNTIME_ENV}。"
+            "请先运行 scripts/build_macos_vgmstream_runtime.py 生成当前架构运行时。"
+        )
+
+    runtime_dir = Path(raw_runtime_dir).expanduser().resolve()
+    try:
+        validate_runtime_directory(
+            runtime_dir,
+            expected_arch=normalize_architecture(),
+            require_manifest=True,
+        )
+    except RuntimeBuildError as exc:
+        raise RuntimeError(f"macOS vgmstream 运行时无效: {exc}") from exc
+    return runtime_dir
+
+
+def stage_macos_tools_without_legacy_vgmstream(tools_dir: Path, destination: Path) -> Path:
+    """复制原有工具，但不让旧的 Homebrew macOS CLI 进入 .app。"""
+    source = Path(tools_dir).resolve()
+    legacy_parent = source / "vgmstream"
+
+    def ignore_legacy(current_dir: str, names: list[str]) -> set[str]:
+        if Path(current_dir).resolve() == legacy_parent:
+            return {"macos"} & set(names)
+        return set()
+
+    shutil.copytree(source, destination, ignore=ignore_legacy)
+    legacy_copy = destination / "vgmstream" / "macos"
+    if legacy_copy.exists():
+        raise RuntimeError(f"旧 macOS vgmstream CLI 不应被打包: {legacy_copy}")
+    return destination
+
+
+def install_macos_vgmstream_runtime(bundle_path: Path, runtime_dir: Path) -> Path:
+    """安装已验证的运行时到 app Frameworks；随后由现有流程统一 ad-hoc 签名。"""
+    contents_dir = Path(bundle_path) / "Contents"
+    frameworks_dir = contents_dir / "Frameworks"
+    if not contents_dir.is_dir():
+        raise RuntimeError(f"未找到 macOS app Contents 目录: {contents_dir}")
+
+    destination = frameworks_dir / "AimerWTVgmstream"
+    if destination.exists():
+        if not destination.is_dir() or destination.is_symlink():
+            raise RuntimeError(f"不安全的 macOS 运行时目标路径: {destination}")
+        shutil.rmtree(destination)
+    shutil.copytree(runtime_dir, destination, copy_function=shutil.copy2)
+
+    try:
+        validate_runtime_directory(
+            destination,
+            expected_arch=normalize_architecture(),
+            require_manifest=True,
+        )
+    except RuntimeBuildError as exc:
+        raise RuntimeError(f"安装到 app 后的 macOS vgmstream 运行时无效: {exc}") from exc
+    return destination
 
 
 def clean_build_artifacts():
@@ -229,13 +326,21 @@ def load_secrets_from_app_secrets() -> dict[str, str]:
     return values
 
 
-def resolve_hidden_theme_files() -> tuple[str, ...]:
-    """口令模块存在时以其名单为准，避免打包清单漏掉 UP 主题。"""
+def load_local_theme_unlock():
+    """加载本地的可选主题口令模块。
+
+    该模块和主题文件有意不进入公开仓库。公开 GitHub 构建应当产出可用的
+    开源版本；只有本地存在该模块时，才要求完整校验并打包支持者主题。
+    """
+    unlock_service = PROJECT_ROOT / "services" / "theme_unlock" / "service.py"
+    if not unlock_service.is_file():
+        return None
+
     try:
-        from services.theme_unlock.service import HIDDEN_THEME_RULES
-    except Exception:
-        return REQUIRED_UNTRACKED_THEME_FILES
-    return tuple(HIDDEN_THEME_RULES.keys())
+        from services.theme_unlock.service import HIDDEN_THEME_RULES, ThemeUnlockService
+    except Exception as exc:
+        raise RuntimeError("无法加载本地主题口令模块") from exc
+    return HIDDEN_THEME_RULES, ThemeUnlockService
 
 
 def _read_theme_meta(theme_path: Path) -> dict:
@@ -245,22 +350,22 @@ def _read_theme_meta(theme_path: Path) -> dict:
 
 
 def verify_hidden_theme_pack() -> tuple[str, ...]:
-    """确认隐藏主题文件和口令模块都在分发范围内，并用本地口令表做兑换自检。"""
+    """校验可选的本地主题包；公开构建没有它时使用 GitHub 回退模式。"""
+    theme_unlock = load_local_theme_unlock()
+    if theme_unlock is None:
+        log.info("   - 未发现本地主题口令模块，构建公开 GitHub 版本")
+        return ()
+
+    hidden_theme_rules, theme_unlock_service = theme_unlock
     theme_dir = PROJECT_ROOT / "web" / "themes"
-    filenames = resolve_hidden_theme_files()
+    filenames = tuple(hidden_theme_rules.keys())
     missing = [name for name in filenames if not (theme_dir / name).is_file()]
     if missing:
         raise RuntimeError("分发版隐藏主题缺失: " + ", ".join(missing))
 
-    unlock_service = PROJECT_ROOT / "services" / "theme_unlock" / "service.py"
-    if not unlock_service.is_file():
-        raise RuntimeError("分发版缺少 services/theme_unlock，主题口令无法生效")
-
-    from services.theme_unlock.service import HIDDEN_THEME_RULES, ThemeUnlockService
-
     required_theme_files = ("chifeng.json", "DaiSongSong.json")
     for filename in required_theme_files:
-        if filename not in HIDDEN_THEME_RULES:
+        if filename not in hidden_theme_rules:
             raise RuntimeError(f"口令模块缺少隐藏主题: {filename}")
 
     chifeng_author = str(_read_theme_meta(theme_dir / "chifeng.json").get("author") or "")
@@ -278,9 +383,9 @@ def verify_hidden_theme_pack() -> tuple[str, ...]:
             self.unlocked = list(unlocked)
             return True
 
-    probe = ThemeUnlockService(_UnlockProbe())
+    probe = theme_unlock_service(_UnlockProbe())
     checked = []
-    for filename, rule in HIDDEN_THEME_RULES.items():
+    for filename, rule in hidden_theme_rules.items():
         if not isinstance(rule, dict) or rule.get("admin_only"):
             continue
         code = str(rule.get("code") or "").strip()
@@ -329,8 +434,9 @@ def _copy_untracked_build_assets(web_pack_dir: Path) -> int:
         if not dst.exists():
             shutil.copy2(source, dst)
             copied += 1
-    packed_themes = sorted(path.name for path in themes_dst.glob("*.json"))
-    log.info("   - 已纳入主题文件: " + ", ".join(packed_themes))
+    if hidden_theme_files:
+        packed_themes = sorted(path.name for path in themes_dst.glob("*.json"))
+        log.info("   - 已纳入本地主题文件: " + ", ".join(packed_themes))
     return copied
 
 
@@ -387,9 +493,16 @@ def require_build_env() -> dict[str, str]:
             continue
         values[key] = value
 
+    allow_missing = os.environ.get(ALLOW_MISSING_BUILD_SECRETS_ENV, "").strip().lower()
     if missing:
-        raise RuntimeError(
-            "缺少必填环境变量: " + ", ".join(missing)
+        if allow_missing not in {"1", "true", "yes"}:
+            raise RuntimeError(
+                "缺少必填环境变量: " + ", ".join(missing)
+            )
+        for key in missing:
+            values[key] = DEVELOPMENT_BUILD_SECRET_DEFAULTS[key]
+        log.warning(
+            "开发构建跳过遥测密钥校验，发布包将禁用遥测：" + ", ".join(missing)
         )
 
     report_url_error = "REPORT_URL 必须是包含主机名的绝对 HTTPS URL"
@@ -459,6 +572,7 @@ def build_exe():
         write_version_info(version_file)
 
         is_macos = sys.platform == "darwin"
+        macos_runtime_dir = resolve_macos_vgmstream_runtime() if is_macos else None
 
         cmd = [
             sys.executable, "-m", "PyInstaller",
@@ -476,12 +590,18 @@ def build_exe():
             "--hidden-import", "certifi",
             "--hidden-import", "charset_normalizer",
             "--hidden-import", "bottle",
-            "--hidden-import", "services.theme_unlock",
-            "--hidden-import", "services.theme_unlock.service",
             "--collect-all", "webview",
             "--collect-all", "pystray",
             "main.py"
         ]
+
+        # 支持者主题口令模块不属于公开仓库；主程序会在其缺失时走 GitHub
+        # 回退服务，因此公开 CI 不能把它当成强制 hidden import。
+        if load_local_theme_unlock() is not None:
+            cmd.extend([
+                "--hidden-import", "services.theme_unlock",
+                "--hidden-import", "services.theme_unlock.service",
+            ])
 
         if is_macos:
             cmd.extend([
@@ -508,10 +628,17 @@ def build_exe():
             raise RuntimeError("缺少 services/sight_vehicle_catalog.json，无法打包炮镜车辆目录")
         cmd.extend(["--add-data", f"{catalog_json}{sep}services"])
 
-        # 可选打包 tools 目录（例如 vgmstream-cli 及其依赖）
+        # 可选打包 tools 目录。macOS 的旧 vgmstream-cli 使用 Homebrew
+        # 绝对依赖，因此只能由专用自包含运行时替代，不能随 tools 原样复制。
         tools_dir = PROJECT_ROOT / "tools"
         if tools_dir.is_dir():
-            cmd.extend(["--add-data", f"{tools_dir}{sep}tools"])
+            tools_pack_dir = tools_dir
+            if is_macos:
+                tools_pack_dir = stage_macos_tools_without_legacy_vgmstream(
+                    tools_dir,
+                    Path(tmp_dir) / "tools",
+                )
+            cmd.extend(["--add-data", f"{tools_pack_dir}{sep}tools"])
         else:
             log.warning("未发现 tools 目录，跳过工具文件打包")
 
@@ -564,8 +691,11 @@ def build_exe():
                 exe_name = EXE_DISPLAY_NAME
             exe_path = dist_dir / exe_name
             if is_macos:
-                finalize_macos_bundle(exe_path)
-                log.info("已写入 macOS 版本号并完成 ad-hoc 签名校验")
+                # 运行时进入 Frameworks 后再统一做现有 ad-hoc 签名，确保每个
+                # dylib、CLI、清单和许可证都在最终签名覆盖范围内。
+                installed_runtime = install_macos_vgmstream_runtime(exe_path, macos_runtime_dir)
+                finalize_macos_bundle(exe_path, runtime_dir=installed_runtime)
+                log.info("已安装自包含 macOS 试听运行时，写入版本号并完成 ad-hoc 签名校验")
             log.info("[OK] 打包成功！")
             log.info(f"输出文件: {exe_path}")
             return True
